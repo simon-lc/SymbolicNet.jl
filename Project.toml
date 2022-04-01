@@ -1,0 +1,4 @@
+name = "SymbolicNet"
+uuid = "adf89dfc-f7f5-498b-a4aa-6139227c9fdc"
+authors = ["simon-lc <simonlc@stanford.edu>"]
+version = "0.1.0"
