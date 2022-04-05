@@ -110,9 +110,18 @@ end
 #         Symbolics._build_and_inject_function(expression_module, expr)
 #     end
 # end
+import SymbolicUtils.toexpr
+function toexpr(s::Symbolics.SetArray, st)
+    ex = quote
+        @show "here"
+        $([:($(SymbolicUtils.toexpr(s.arr, st))[$(ex isa SymbolicUtils.AtIndex ? ex.i : i)] = $(SymbolicUtils.toexpr(ex, st)))
+           for (i, ex) in enumerate(s.elems)]...)
+        nothing
+    end
+    s.inbounds ? :(@inbounds $ex) : ex
+end
 
-
-function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds, skipzeros, )
+function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds, skipzeros, var::Bool=true)
     if outputidxs === nothing
         outputidxs = collect(eachindex(rhss))
     end
@@ -126,10 +135,11 @@ function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds,
                                    rhss[i])
                            for i in ii])
     push!(exprs, setterexpr)
+    @show setterexpr
     for j in jj
-        push!(exprs, _set_array(LiteralExpr(:($out[$j])), nothing, rhss[j], checkbounds, skipzeros))
+        push!(exprs, Symbolics._set_array(LiteralExpr(:($out[$j])), nothing, rhss[j], checkbounds, skipzeros))
     end
-    LiteralExpr(quote
+    Symbolics.LiteralExpr(quote
                     $(exprs...)
                 end)
 end
