@@ -112,6 +112,29 @@ end
 # end
 
 
+function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds, skipzeros, )
+    if outputidxs === nothing
+        outputidxs = collect(eachindex(rhss))
+    end
+    # sometimes outputidxs is a Tuple
+    ii = findall(i->!(rhss[i] isa AbstractArray) && !(skipzeros && _iszero(rhss[i])), eachindex(outputidxs))
+    jj = findall(i->rhss[i] isa AbstractArray, eachindex(outputidxs))
+    exprs = []
+    setterexpr = Symbolics.SetArray(!checkbounds,
+                          out,
+                          [Symbolics.AtIndex(outputidxs[i],
+                                   rhss[i])
+                           for i in ii])
+    push!(exprs, setterexpr)
+    for j in jj
+        push!(exprs, _set_array(LiteralExpr(:($out[$j])), nothing, rhss[j], checkbounds, skipzeros))
+    end
+    LiteralExpr(quote
+                    $(exprs...)
+                end)
+end
+
+
 function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray, args...;
                        expression = Val{true},
                        expression_module = @__MODULE__(),
@@ -150,29 +173,40 @@ function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray
     end
 
     if expression == Val{true}
-        out = Symbolics.Sym{Any}(:out)
-        body1 = postprocess_fbody(Symbolics.make_array(parallel, dargs, rhss, similarto))
-        body2 = postprocess_fbody(Symbolics.set_array(parallel,
+        out0 = Symbolics.Sym{Any}(:out0)
+        out1 = Symbolics.Sym{Any}(:out1)
+        X1a = Symbolics.Sym{Any}(:X1a)
+        body1 = postprocess_fbody(Symbolics.set_array(parallel,
                                     dargs,
-                                    out,
+                                    out0,
                                     outputidxs,
                                     rhss,
                                     checkbounds,
                                     skipzeros))
-        body_expr = [Symbolics.toexpr(body1), body2.ex]
+        body2 = postprocess_fbody(Symbolics.set_array(parallel,
+                                    dargs,
+                                    out1,
+                                    outputidxs,
+                                    rhss,
+                                    checkbounds,
+                                    skipzeros))
+        # assign0 = [Symbolics.Assignment(Meta.parse("var\"x1a[$i]\""), 0.0) for i=1:3]
+        assign0 = [Symbolics.Assignment(Meta.parse("X1a[$i]"), 0.0) for i=1:3]
+        assign_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign0]
+
+        body_expr = [assign_ex..., body1.ex, body2.ex]
         chain_body = Symbolics.LiteralExpr(
             quote
                 $(body_expr...)
             end)
-        chain_expr = Symbolics.Func([out, dargs...], [], chain_body)
+        chain_expr = Symbolics.Func([out1, out0, dargs...], [], chain_body)
 
-        return Symbolics.toexpr(oop_expr), Symbolics.toexpr(ip_expr), Symbolics.toexpr(chain_expr), (body1, body2, dargs)
+        return Symbolics.toexpr(oop_expr), Symbolics.toexpr(ip_expr), Symbolics.toexpr(chain_expr), (body1, body2, dargs, chain_expr)
     else
         return Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(oop_expr)),
         Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(ip_expr))
     end
 end
-
 
 Nf = 3
 fs = SVector{Nf,Function}(f1,f2,f3)
@@ -187,9 +221,10 @@ my_eval = eval(my_fct)
 x0 = rand(N)
 x1 = zeros(N)
 x2 = zeros(N)
-my_eval(x2, x0)
-@benchmark my_eval($x1, $x0)
-
+my_eval(x2, x1, x0)
+@benchmark my_eval($x2, $x1, $x0)
+my_eval2(x2, x0, x1::Vector{T}=zeros(N)) where {N,T} = my_eval(x2, x1, x0)
+my_eval2(x2, x1)
 
 
 
@@ -197,8 +232,14 @@ body
 body1 = body[1]
 body2 = body[2]
 dargs = body[3]
+fct = body[4]
+Symbolics.toexpr(fct.args)
+dargs
 Symbolics.toexpr(body2)
+map(x->Symbolics.toexpr(x, Symbolics.LazyState()), fct.args)
 
+body = Symbolics.Let(dargs, :(), false)
+Symbolics.toexpr(body)
 
 
 fff = eval(Symbolics.toexpr(Symbolics.Func(dargs, [], body1)))
