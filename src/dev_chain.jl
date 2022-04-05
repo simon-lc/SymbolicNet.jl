@@ -3,6 +3,7 @@ using Symbolics
 using Graphs
 using StaticArrays
 using BenchmarkTools
+using SymbolicUtils
 
 
 function chain_code_generation(fs::SVector{Nf,Function}, n_input::Int) where Nf
@@ -32,15 +33,11 @@ function chain_code_generation(fs::SVector{Nf,Function}, n_input::Int) where Nf
     return SVector{Nf,Function}(fs_eval), SVector{Nf,Expr}(fs_expr)
 end
 
-function vectorize(a::Symbolics.Arr{Num, 1})
-    v = [a[i] for i=1:length(a)]
-    return v
-end
 
 # Demonstration
 function f1(x0)
-    x1 = sin.(2 .* x0) .+ x0 .+ 1.0
-    # x1 = 2 .* x0
+    # x1 = sin.(2 .* x0) .+ x0 .+ 1.0
+    x1 = 2 .* x0
     return x1
 end
 
@@ -93,41 +90,182 @@ function chain_assembly(fs_ev::SVector{Nf,Function}) where Nf
     return f_assembled
 end
 
+#
+# function _build_function(target::Symbolics.JuliaTarget, op, args...;
+#                          conv = Symbolics.toexpr,
+#                          expression = Val{true},
+#                          expression_module = @__MODULE__(),
+#                          checkbounds = false,
+#                          states = Symbolics.LazyState(),
+#                          linenumbers = true)
+#     dargs = map((x) -> Symbolics.destructure_arg(x[2], !checkbounds, Symbol("ˍ₋arg$(x[1])")), enumerate([args...]))
+#     # @show dargs
+#     @show Symbolics.Func(dargs, [], op)
+#     expr = Symbolics.toexpr(Symbolics.Func(dargs, [], op), states)
+#     @show expr
+#
+#     if expression == Val{true}
+#         expr
+#     else
+#         Symbolics._build_and_inject_function(expression_module, expr)
+#     end
+# end
 
-function chain_assembly2(fs_ev::SVector{Nf,Function}) where Nf
-    function f_local(o0::Vector{T}, o1::Vector{T}, o2::Vector{T}, o3::Vector{T}) where T
-        fs_ev[1](o1, o0)
-        fs_ev[2](o2, o1)
-        fs_ev[3](o3, o2)
-        return o3
+
+function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray, args...;
+                       expression = Val{true},
+                       expression_module = @__MODULE__(),
+                       checkbounds = false,
+                       postprocess_fbody=ex -> ex,
+                       linenumbers = false,
+                       outputidxs=nothing,
+                       skipzeros = false,
+                       wrap_code = (nothing, nothing),
+                       fillzeros = skipzeros && !(rhss isa SparseMatrixCSC),
+                       parallel=Symbolics.SerialForm(), kwargs...)
+
+    dargs = map((x) -> Symbolics.destructure_arg(x[2], !checkbounds,
+                                  Symbol("ˍ₋arg$(x[1])")), enumerate([args...]))
+    i = findfirst(x->x isa Symbolics.DestructuredArgs, dargs)
+    similarto = i === nothing ? Array : dargs[i].name
+    oop_expr = Symbolics.Func(dargs, [],
+                    postprocess_fbody(Symbolics.make_array(parallel, dargs, rhss, similarto)))
+
+    if !isnothing(wrap_code[1])
+        oop_expr = wrap_code[1](oop_expr)
     end
-    return f_local
+
+    out = Symbolics.Sym{Any}(:ˍ₋out)
+    ip_expr = Symbolics.Func([out, dargs...], [],
+                   postprocess_fbody(Symbolics.set_array(parallel,
+                                               dargs,
+                                               out,
+                                               outputidxs,
+                                               rhss,
+                                               checkbounds,
+                                               skipzeros)))
+
+    if !isnothing(wrap_code[2])
+        ip_expr = wrap_code[2](ip_expr)
+    end
+
+    if expression == Val{true}
+        out = Symbolics.Sym{Any}(:out)
+        body1 = postprocess_fbody(Symbolics.make_array(parallel, dargs, rhss, similarto))
+        body2 = postprocess_fbody(Symbolics.set_array(parallel,
+                                    dargs,
+                                    out,
+                                    outputidxs,
+                                    rhss,
+                                    checkbounds,
+                                    skipzeros))
+        body_expr = [Symbolics.toexpr(body1), body2.ex]
+        chain_body = Symbolics.LiteralExpr(
+            quote
+                $(body_expr...)
+            end)
+        chain_expr = Symbolics.Func([out, dargs...], [], chain_body)
+
+        return Symbolics.toexpr(oop_expr), Symbolics.toexpr(ip_expr), Symbolics.toexpr(chain_expr), (body1, body2, dargs)
+    else
+        return Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(oop_expr)),
+        Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(ip_expr))
+    end
 end
 
-@generated function chain_assembly3(fs_ev::SVector{Nf,Function}) where Nf
-    # function f_local(o0::Vector{T}, o1::Vector{T}, o2::Vector{T}, o3::Vector{T}) where T
-    #     fs_ev[1](o1, o0)
-    #     fs_ev[2](o2, o1)
-    #     fs_ev[3](o3, o2)
-    #     return o3
-    # end
-    f(o0::Vector{T}, o1::Vector{T}, o2::Vector{T}, o3::Vector{T}) where T = floc(fs_ev, o0, o1, o2, o3)
-    return f
-end
-
-function floc(fs_ev::SVector{Nf,Function}, o0::Vector{T}, o1::Vector{T}, o2::Vector{T}, o3::Vector{T}) where {Nf,T}
-    fs_ev[1]
-    fs_ev[1](o1, o0)
-    # fs_ev[2](o2, o1)
-    # fs_ev[3](o3, o2)
-    return o3
-end
 
 Nf = 3
 fs = SVector{Nf,Function}(f1,f2,f3)
 N = 2
-fs_eval, fs_expr = chain_code_generation(fs, N)
-fs_expr
+
+@variables x0a[1:N]
+x0v = Symbolics.scalarize(x0a)
+x1v = f1(x0v)
+_, _, my_fct, body = build_chain_function(Symbolics.JuliaTarget(), x1v, x0v)
+my_fct
+my_eval = eval(my_fct)
+x0 = rand(N)
+x1 = zeros(N)
+x2 = zeros(N)
+my_eval(x2, x0)
+@benchmark my_eval($x1, $x0)
+
+
+
+
+body
+body1 = body[1]
+body2 = body[2]
+dargs = body[3]
+Symbolics.toexpr(body2)
+
+
+
+fff = eval(Symbolics.toexpr(Symbolics.Func(dargs, [], body1)))
+Symbolics.toexpr(Symbolics.Func(dargs, [], body1))
+fff([1,3.0])
+
+bex1 = Symbolics.toexpr(body[1], Symbolics.LazyState())
+bex2 = body[2]
+Symbolics.toexpr(Symbolics.LiteralExpr(quote
+        $bex1
+    end))
+Symbolics.toexpr(body[2])
+
+bex1 = Symbolics.LiteralExpr(body[1])
+bex1.head
+bex2.head
+
+
+body[2].ex
+body[1]
+bex1 = Symbolics.toexpr(body[1])
+
+SymbolicUtils.
+
+
+
+body_lit = Symbolics.LiteralExpr(
+    quote
+        $(body[2].ex)
+    end)
+Symbolics.toexpr(Symbolics.Func([], [], body_lit))
+
+body_lit = Symbolics.LiteralExpr(
+    quote
+        $bex1
+    end)
+
+Symbolics.toexpr(Symbolics.Func([], [], body_lit))
+
+
+a = 10
+a = 10
+a = 10
+a = 10
+
+
+
+
+
+
+
+
+
+
+
+f1s = eval(Symbolics._build_function(Symbolics.JuliaTarget(), x1v, x0v, expression=Val{true}))
+f1s = eval(build_function(x1v, x0v, expression=Val{true})[2])
+
+Symbolics._set_array(Symbolics.SerialForm(), x0v, x1v)
+Symbolics.toexpr(x1v, Symbolics.LazyState())
+
+x0 = rand(N)
+x1 = rand(N)
+@benchmark $f1s($x1, $x0)
+
+
+@show build_function(x1v, x0v, parallel=Symbolics.SerialForm())[1]
 
 ff = chain_assembly2(fs_eval)
 ff = chain_assembly3(fs_eval)
