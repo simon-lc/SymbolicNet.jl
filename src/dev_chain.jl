@@ -58,70 +58,30 @@ function f(x0)
     return x3
 end
 
-function chain_assembly(fs_ev::SVector{Nf,Function}) where Nf
-    fargs = Meta.parse.(["f_$i" for i=1:Nf])
-    typed_fargs = Meta.parse.(["f$i::F$i" for i=1:Nf])
 
-    oargs = Meta.parse.(["o$i" for i=0:Nf])
-    typed_oargs = Meta.parse.(["o$i::Vector{T}" for i=0:Nf])
 
-    types = Meta.parse.(["F$i" for i=1:Nf])
 
-    body = Meta.parse.(["f$i(o$i, o$(i-1))" for i=1:Nf])
-    body = [body..., Meta.parse("return o$(Nf)")]
-    ex = :(f_local($(typed_fargs...), $(typed_oargs...)) where {T,$(types...)} = $(body...))
-    eval(ex)
-
-    # for i = 1:Nf
-    #     eval(Meta.parse("f$i = fs_ev[$i]"))
-    # end
-    f_1 = fs_ev[1]
-    f_2 = fs_ev[2]
-    f_3 = fs_ev[3]
-
-    # eval(ex)
-    fargs = Meta.parse.(["fs_ev[$i]" for i=1:Nf])
-    oargs = Meta.parse.(["o$i" for i=0:Nf])
-    body = :(f_local($(fargs...), $(oargs...)))
-    ex = :(f_assembled($(oargs...)) = $body)
-    @show ex
-    eval(ex)
-    # f(o0, o1, o2, o3) = f_local(fs_ev[1], fs_ev[2], fs_ev[3], o0, o1, o2, o3)
-    return f_assembled
+struct CustomSetArray
+    inbounds::Bool
+    arr
+    elems  # Either iterator of Pairs or just an iterator
 end
 
-#
-# function _build_function(target::Symbolics.JuliaTarget, op, args...;
-#                          conv = Symbolics.toexpr,
-#                          expression = Val{true},
-#                          expression_module = @__MODULE__(),
-#                          checkbounds = false,
-#                          states = Symbolics.LazyState(),
-#                          linenumbers = true)
-#     dargs = map((x) -> Symbolics.destructure_arg(x[2], !checkbounds, Symbol("ˍ₋arg$(x[1])")), enumerate([args...]))
-#     # @show dargs
-#     @show Symbolics.Func(dargs, [], op)
-#     expr = Symbolics.toexpr(Symbolics.Func(dargs, [], op), states)
-#     @show expr
-#
-#     if expression == Val{true}
-#         expr
-#     else
-#         Symbolics._build_and_inject_function(expression_module, expr)
-#     end
-# end
-import SymbolicUtils.toexpr
-function toexpr(s::Symbolics.SetArray, st)
+function custom_set_array_prefix(x, ex, i, st)
+    expr = :($(Symbolics.toexpr(x, st))[$(ex isa Symbolics.AtIndex ? ex.i : i)])
+    Symbol(expr)
+end
+
+function Symbolics.toexpr(s::CustomSetArray, st)
     ex = quote
-        @show "here"
-        $([:($(SymbolicUtils.toexpr(s.arr, st))[$(ex isa SymbolicUtils.AtIndex ? ex.i : i)] = $(SymbolicUtils.toexpr(ex, st)))
+        $([:($(custom_set_array_prefix(s.arr, ex, i, st)) = $(Symbolics.toexpr(ex, st)))
            for (i, ex) in enumerate(s.elems)]...)
         nothing
     end
     s.inbounds ? :(@inbounds $ex) : ex
 end
 
-function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds, skipzeros, var::Bool=true)
+function custom_set_array(out, outputidxs, rhss::AbstractArray, checkbounds, skipzeros, var::Bool=true)
     if outputidxs === nothing
         outputidxs = collect(eachindex(rhss))
     end
@@ -129,13 +89,12 @@ function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds,
     ii = findall(i->!(rhss[i] isa AbstractArray) && !(skipzeros && _iszero(rhss[i])), eachindex(outputidxs))
     jj = findall(i->rhss[i] isa AbstractArray, eachindex(outputidxs))
     exprs = []
-    setterexpr = Symbolics.SetArray(!checkbounds,
+    setterexpr = CustomSetArray(!checkbounds,
                           out,
                           [Symbolics.AtIndex(outputidxs[i],
                                    rhss[i])
                            for i in ii])
     push!(exprs, setterexpr)
-    @show setterexpr
     for j in jj
         push!(exprs, Symbolics._set_array(LiteralExpr(:($out[$j])), nothing, rhss[j], checkbounds, skipzeros))
     end
@@ -145,7 +104,7 @@ function Symbolics._set_array(out, outputidxs, rhss::AbstractArray, checkbounds,
 end
 
 
-function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray, args...;
+function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray, args;
                        expression = Val{true},
                        expression_module = @__MODULE__(),
                        checkbounds = false,
@@ -153,68 +112,56 @@ function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray
                        linenumbers = false,
                        outputidxs=nothing,
                        skipzeros = false,
-                       wrap_code = (nothing, nothing),
+                       wrap_code = nothing,
+                       # fillzeros = skipzeros .&& !.(rhss .isa SparseMatrixCSC),
                        fillzeros = skipzeros && !(rhss isa SparseMatrixCSC),
                        parallel=Symbolics.SerialForm(), kwargs...)
 
-    dargs = map((x) -> Symbolics.destructure_arg(x[2], !checkbounds,
-                                  Symbol("ˍ₋arg$(x[1])")), enumerate([args...]))
-    i = findfirst(x->x isa Symbolics.DestructuredArgs, dargs)
-    similarto = i === nothing ? Array : dargs[i].name
-    oop_expr = Symbolics.Func(dargs, [],
-                    postprocess_fbody(Symbolics.make_array(parallel, dargs, rhss, similarto)))
+    Nf = length(rhss)
+    @assert Nf == length(args)
+    dargs = [map((x) -> Symbolics.destructure_arg(x[2], !checkbounds,
+                                  Symbol("ˍ₋arg$(x[1])")), enumerate([args[i]...])) for i=1:Nf]
+    i = [findfirst(x->x isa Symbolics.DestructuredArgs, dargs[i]) for i=1:Nf]
+    # similarto = [i === nothing ? Array : dargs[j][i].name for j=1:Nf]
 
-    if !isnothing(wrap_code[1])
-        oop_expr = wrap_code[1](oop_expr)
-    end
+    outs = [Symbolics.Sym{Any}(Symbol(:out, i)) for i = 0:2]
+    xia = [Symbolics.Sym{Any}(Symbol(:x, i, :a)) for i = 1:3]
+    bodies = [postprocess_fbody(custom_set_array(
+                               # parallel,
+                               # dargs,
+                               xia[i],
+                               outputidxs,
+                               rhss[i],
+                               checkbounds,
+                               skipzeros)) for i=1:Nf-1]
+    body = postprocess_fbody(Symbolics.set_array(
+                               parallel,
+                               dargs[end],
+                               outs[end],
+                               outputidxs,
+                               rhss[end],
+                               checkbounds,
+                               skipzeros))
+    assign1 = [Symbolics.Assignment(Meta.parse("var\"x1a[$i]\""), 0.0) for i=1:2]
+    assign2 = [Symbolics.Assignment(Meta.parse("var\"x2a[$i]\""), 0.0) for i=1:2]
+    assign1_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign1]
+    assign2_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign2]
 
-    out = Symbolics.Sym{Any}(:ˍ₋out)
-    ip_expr = Symbolics.Func([out, dargs...], [],
-                   postprocess_fbody(Symbolics.set_array(parallel,
-                                               dargs,
-                                               out,
-                                               outputidxs,
-                                               rhss,
-                                               checkbounds,
-                                               skipzeros)))
+    body_expr = [assign1_ex..., assign2_ex..., getfield.(bodies, :ex)..., body.ex]
+    chain_body = Symbolics.LiteralExpr(
+       quote
+           $(body_expr...)
+       end)
+    chain_expr = Symbolics.Func([outs[end], dargs[1]...], [], chain_body)
 
-    if !isnothing(wrap_code[2])
-        ip_expr = wrap_code[2](ip_expr)
+    if !isnothing(wrap_code)
+        chain_expr = wrap_code(chain_expr)
     end
 
     if expression == Val{true}
-        out0 = Symbolics.Sym{Any}(:out0)
-        out1 = Symbolics.Sym{Any}(:out1)
-        X1a = Symbolics.Sym{Any}(:X1a)
-        body1 = postprocess_fbody(Symbolics.set_array(parallel,
-                                    dargs,
-                                    out0,
-                                    outputidxs,
-                                    rhss,
-                                    checkbounds,
-                                    skipzeros))
-        body2 = postprocess_fbody(Symbolics.set_array(parallel,
-                                    dargs,
-                                    out1,
-                                    outputidxs,
-                                    rhss,
-                                    checkbounds,
-                                    skipzeros))
-        # assign0 = [Symbolics.Assignment(Meta.parse("var\"x1a[$i]\""), 0.0) for i=1:3]
-        assign0 = [Symbolics.Assignment(Meta.parse("X1a[$i]"), 0.0) for i=1:3]
-        assign_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign0]
-
-        body_expr = [assign_ex..., body1.ex, body2.ex]
-        chain_body = Symbolics.LiteralExpr(
-            quote
-                $(body_expr...)
-            end)
-        chain_expr = Symbolics.Func([out1, out0, dargs...], [], chain_body)
-
-        return Symbolics.toexpr(oop_expr), Symbolics.toexpr(ip_expr), Symbolics.toexpr(chain_expr), (body1, body2, dargs, chain_expr)
+        return Symbolics.toexpr(chain_expr)
     else
-        return Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(oop_expr)),
-        Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(ip_expr))
+        return Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(chain_expr))
     end
 end
 
@@ -223,18 +170,23 @@ fs = SVector{Nf,Function}(f1,f2,f3)
 N = 2
 
 @variables x0a[1:N]
+@variables x1a[1:N]
+@variables x2a[1:N]
 x0v = Symbolics.scalarize(x0a)
-x1v = f1(x0v)
-_, _, my_fct, body = build_chain_function(Symbolics.JuliaTarget(), x1v, x0v)
+x1v = Symbolics.scalarize(x1a)
+x2v = Symbolics.scalarize(x2a)
+x1 = f1(x0v)
+x2 = f2(x1v)
+x3 = f3(x2v)
+my_fct = build_chain_function(Symbolics.JuliaTarget(), [x1,x2,x3], [x0v,x1v,x2v])
 my_fct
 my_eval = eval(my_fct)
 x0 = rand(N)
 x1 = zeros(N)
 x2 = zeros(N)
-my_eval(x2, x1, x0)
-@benchmark my_eval($x2, $x1, $x0)
-my_eval2(x2, x0, x1::Vector{T}=zeros(N)) where {N,T} = my_eval(x2, x1, x0)
-my_eval2(x2, x1)
+x3 = zeros(N)
+my_eval(x3, x0)
+@benchmark my_eval($x3, $x0)
 
 
 
