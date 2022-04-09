@@ -37,7 +37,7 @@ end
 # Demonstration
 function f1(x0)
     # x1 = sin.(2 .* x0) .+ x0 .+ 1.0
-    x1 = 2 .* x0
+    x1 = x0.^2
     return x1
 end
 
@@ -73,11 +73,16 @@ function custom_set_array_prefix(x, ex, i, st)
 end
 
 function Symbolics.toexpr(s::CustomSetArray, st)
+    @show st
+    # st = Symbolics.LazyState()
+    @show st
+    @show "#########################################"
     ex = quote
         $([:($(custom_set_array_prefix(s.arr, ex, i, st)) = $(Symbolics.toexpr(ex, st)))
            for (i, ex) in enumerate(s.elems)]...)
         nothing
     end
+    @show ex
     s.inbounds ? :(@inbounds $ex) : ex
 end
 
@@ -120,20 +125,49 @@ function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray
     Nf = length(rhss)
     @assert Nf == length(args)
     dargs = [map((x) -> Symbolics.destructure_arg(x[2], !checkbounds,
-                                  Symbol("ˍ₋arg$(x[1])")), enumerate([args[i]...])) for i=1:Nf]
-    i = [findfirst(x->x isa Symbolics.DestructuredArgs, dargs[i]) for i=1:Nf]
+                                  Symbol("ˍ₋arg$(x[1])")), enumerate([args[i]])) for i=1:Nf]
+    # i = [findfirst(x->x isa Symbolics.DestructuredArgs, dargs[i]) for i=1:Nf]
     # similarto = [i === nothing ? Array : dargs[j][i].name for j=1:Nf]
+    @show rhss[1]
+    @show rhss[2]
 
     outs = [Symbolics.Sym{Any}(Symbol(:out, i)) for i = 0:2]
     xia = [Symbolics.Sym{Any}(Symbol(:x, i, :a)) for i = 1:3]
-    bodies = [postprocess_fbody(custom_set_array(
+    xiv = [args[1], args[2], args[3]]
+    body1 = postprocess_fbody(custom_set_array(
                                # parallel,
                                # dargs,
-                               xia[i],
+                               xia[1],
                                outputidxs,
-                               rhss[i],
+                               rhss[1],
                                checkbounds,
-                               skipzeros)) for i=1:Nf-1]
+                               skipzeros))
+    body2 = postprocess_fbody(custom_set_array(
+                               # parallel,
+                               # dargs,
+                               xia[2],
+                               outputidxs,
+                               rhss[1],
+                               checkbounds,
+                               skipzeros))
+    @show body2
+    body2 = postprocess_fbody(custom_set_array(
+                               # parallel,
+                               # dargs,
+                               xia[2],
+                               outputidxs,
+                               rhss[2],
+                               checkbounds,
+                               skipzeros))
+    @show body2
+    # bodies = [postprocess_fbody(custom_set_array(
+    #                            # parallel,
+    #                            # dargs,
+    #                            xia[i],
+    #                            outputidxs,
+    #                            rhss[i],
+    #                            checkbounds,
+    #                            skipzeros)) for i=1:Nf-1]
     body = postprocess_fbody(Symbolics.set_array(
                                parallel,
                                dargs[end],
@@ -144,26 +178,50 @@ function build_chain_function(target::Symbolics.JuliaTarget, rhss::AbstractArray
                                skipzeros))
     assign1 = [Symbolics.Assignment(Meta.parse("var\"x1a[$i]\""), 0.0) for i=1:2]
     assign2 = [Symbolics.Assignment(Meta.parse("var\"x2a[$i]\""), 0.0) for i=1:2]
-    assign1_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign1]
-    assign2_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign2]
+    # assign1_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign1]
+    # assign2_ex = [Symbolics.toexpr(a, Symbolics.LazyState()) for a in assign2]
 
-    body_expr = [assign1_ex..., assign2_ex..., getfield.(bodies, :ex)..., body.ex]
+    # body_expr = [assign1_ex..., assign2_ex..., getfield.(bodies[1:2], :ex)...,]# body.ex]
+    # body_expr = [assign1_ex..., assign2_ex..., getfield.([body1,], :ex)...,]# body.ex]
+    body_expr = [getfield.([body1, body2], :ex)...,]# body.ex]
     chain_body = Symbolics.LiteralExpr(
        quote
            $(body_expr...)
        end)
-    chain_expr = Symbolics.Func([outs[end], dargs[1]...], [], chain_body)
-
+    # @show Symbolics.toexpr(Symbolics.LiteralExpr(
+    #    quote
+    #        $(body1...)
+    #    end))
+    # @show Symbolics.toexpr(Symbolics.LiteralExpr(
+    #   quote
+    #       $(body2...)
+    #   end))
+    # @show Symbolics.toexpr(body1)
+    # ex1 = Symbolics.toexpr(Symbolics.toexpr(body1))
+    # ex2 = Symbolics.toexpr(Symbolics.toexpr(body2))
+    # chain_body = :($(ex1), $(ex2))
+    chain_expr = Symbolics.Func([outs[end], dargs[1]...], [assign1..., assign2...], chain_body)
+    # @show Symbolics.toexpr(chain_body)
     if !isnothing(wrap_code)
         chain_expr = wrap_code(chain_expr)
     end
-
+    # @show chain_expr
     if expression == Val{true}
-        return Symbolics.toexpr(chain_expr)
+        @show "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+        st = Symbolics.LazyState()
+        Symbolics.Code.union_rewrites!(st.rewrites, [xiv[1]..., xiv[2]...])
+
+        @show Symbolics.toexpr(chain_expr, st)
+        return Symbolics.toexpr(chain_expr, st)
     else
         return Symbolics._build_and_inject_function(expression_module, Symbolics.toexpr(chain_expr))
     end
 end
+
+xia = [Symbolics.Sym{Any}(Symbol(:x, i, :a)) for i = 1:3]
+@show Symbolics.LazyState(xia[1])
+@show Symbolics.LazyState(x1v)
+
 
 Nf = 3
 fs = SVector{Nf,Function}(f1,f2,f3)
@@ -186,7 +244,24 @@ x1 = zeros(N)
 x2 = zeros(N)
 x3 = zeros(N)
 my_eval(x3, x0)
-@benchmark my_eval($x3, $x0)
+@benchmark $my_eval($x3, $x0)
+
+Symbolics.arguments
+i = 2
+ss = Symbol(:xx,i,[1:2])
+@variables ss
+Symbolics._parse_vars(:variables, Real, :(x)[1:2])
+x1a_st = @variables x1a[1:2]
+xia = [Symbolics.Sym{Any}(Symbol(:x, i, :a)) for i = 1:3]
+@variables xxx[1:2]
+typeof(xxx[1])
+typeof(xxx[1:2])
+st = Symbolics.LazyState()
+Symbolics.Code.union_rewrites!(st.rewrites, [xxx..., x1a_st...])
+st
+
+
+
 
 
 
@@ -352,3 +427,50 @@ function chain_code_generation(fs::SVector{Nf,Function}, n_input::Int) where Nf
 
     return SVector{Nf,Function}(fs_eval), SVector{Nf,Expr}(fs_ex)
 end
+
+
+using LinearAlgebra
+
+function jacobian(u)
+    U = u[1] * Array(Diagonal(ones(n)))
+    U[2:end,1] = u[2:end]
+    U[1,2:end] = u[2:end]
+    return U
+end
+
+function inverse(u)
+    n = length(u)
+    α = -1/u[1]^2 * norm(u[2:end])^2
+    β = 1 / (1 + α)
+    S1 = zeros(n,n)
+    S1[end,1:end-1] = u[end:-1:2]/u[1]
+    S2 = zeros(n,n)
+    S2[1:end-1,end] = u[end:-1:2]/u[1]
+    P = zeros(n,n)
+    for i = 1:n
+        P[end-i+1,i] = 1
+    end
+    Vi = (I - S1) * (I - β * (S2 * (I - S1)))
+    Ui = P * 1/u[1] * Vi * P
+    return Ui
+end
+
+function inverse(u,x)
+    n = length(u)
+    α = -1/u[1]^2 * norm(u[2:end])^2
+    β = 1 / (1 + α)
+
+    x0 = x - [u[2:end]'*x[2:end]; zeros(n-1)]
+    x1 = x - β * [0; u[2:end] * x0[1]]
+    x2 = x1 - [u[2:end]'*x1[2:end]; zeros(n-1)]
+    x = 1/u[1] * x2
+    return xi
+end
+
+
+n = 3
+x = rand(n)
+u = rand(n)
+U = jacobian(u)
+U * inverse(u) * x - x
+U * inverse(u,x) - x
